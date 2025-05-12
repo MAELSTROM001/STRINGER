@@ -5,7 +5,7 @@ import os
 import base64
 from dotenv import load_dotenv
 from spotify_auth import authenticate_spotify, get_playlist_tracks
-from playlist_analyzer import get_audio_features
+from playlist_analyzer import get_audio_features, fetch_playlist_tracks
 from track_reorderer import reorder_tracks, get_recommendations
 from visualizations import plot_bpm_histogram, plot_key_wheel, plot_energy_valence
 from utils import (
@@ -13,6 +13,7 @@ from utils import (
     check_session_timeout,
     safe_load_file,
     cleanup_session_data,
+    validate_playlist_url,
     safe_copy_to_clipboard,
     log_error,
     cached_plot_bpm_histogram
@@ -1002,16 +1003,6 @@ def cleanup_session_data():
             {k: v for k, v in track.items() if k in ['name', 'artists', 'uri']}
             for track in st.session_state['original_tracks']
         ]
-
-def validate_playlist_url(url):
-    """Validate the Spotify playlist URL format."""
-    if not url:
-        return False, "Please enter a playlist URL"
-    
-    if not url.startswith(("https://open.spotify.com/playlist/", "spotify:playlist:")):
-        return False, "Invalid Spotify playlist URL format"
-    
-    return True, None
 
 @st.cache_data(ttl=3600)
 def cached_plot_bpm_histogram(original_df, optimized_df):

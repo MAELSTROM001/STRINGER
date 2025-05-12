@@ -164,11 +164,3 @@ def authenticate_spotify():
                 'message': f"Error refreshing token: {str(e)}",
                 'spotify_client': None
             }
-
-if playlist_url and st.session_state['spotify_client']:
-    try:
-        # Validate playlist URL
-        is_valid, error_message = validate_playlist_url(playlist_url)
-        if not is_valid:
-            st.error(error_message)
-            st.stop()
