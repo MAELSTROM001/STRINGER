@@ -1,0 +1,7 @@
+streamlit==1.32.0
+pandas==2.2.0
+pyperclip==1.8.2
+python-dotenv==1.0.0
+plotly==5.18.0
+spotipy==2.23.0
+tenacity==8.2.3 
