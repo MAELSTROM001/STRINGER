@@ -4,8 +4,8 @@ import pyperclip
 import os
 import base64
 from dotenv import load_dotenv
-from spotify_auth import authenticate_spotify
-from playlist_analyzer import fetch_playlist_tracks, get_audio_features
+from spotify_auth import authenticate_spotify, get_playlist_tracks
+from playlist_analyzer import get_audio_features
 from track_reorderer import reorder_tracks, get_recommendations
 from visualizations import plot_bpm_histogram, plot_key_wheel, plot_energy_valence
 from utils import (
@@ -13,12 +13,11 @@ from utils import (
     check_session_timeout,
     safe_load_file,
     cleanup_session_data,
-    validate_playlist_url,
     safe_copy_to_clipboard,
     log_error,
     cached_plot_bpm_histogram
 )
-from spotify_utils import fetch_playlist_tracks_with_retry, create_spotify_playlist
+from spotify_utils import create_spotify_playlist
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
 import logging
@@ -584,17 +583,17 @@ if playlist_url and st.session_state['spotify_client']:
 
         with st.spinner("Fetching playlist tracks..."):
             # Fetch and analyze playlist
-            tracks_info = fetch_playlist_tracks_with_retry(st.session_state['spotify_client'], playlist_url)
+            tracks = get_playlist_tracks(playlist_url)
             
-            if not tracks_info or len(tracks_info) == 0:
+            if not tracks:
                 st.error("❌ No tracks found in this playlist or invalid playlist URL.")
             else:
-                playlist_name = tracks_info[0].get('playlist_name', 'Playlist')
-                st.success(f"✅ Successfully loaded '{playlist_name}' with {len(tracks_info)} tracks")
+                playlist_name = tracks[0].get('playlist_name', 'Playlist')
+                st.success(f"✅ Successfully loaded '{playlist_name}' with {len(tracks)} tracks")
                 
                 # Get audio features for the tracks
                 with st.spinner("Analyzing audio features..."):
-                    tracks_with_features = get_audio_features(st.session_state['spotify_client'], tracks_info)
+                    tracks_with_features = get_audio_features(st.session_state['spotify_client'], tracks)
                     st.session_state['original_tracks'] = tracks_with_features
                     
                     # Clean up session data if needed
@@ -1005,17 +1004,14 @@ def cleanup_session_data():
         ]
 
 def validate_playlist_url(url):
+    """Validate the Spotify playlist URL format."""
     if not url:
         return False, "Please enter a playlist URL"
-    if not url.startswith("https://open.spotify.com/playlist/"):
-        return False, "Invalid Spotify playlist URL format"
-    return True, ""
-
-# Usage
-is_valid, error_message = validate_playlist_url(playlist_url)
-if not is_valid:
-    st.error(error_message)
     
+    if not url.startswith(("https://open.spotify.com/playlist/", "spotify:playlist:")):
+        return False, "Invalid Spotify playlist URL format"
+    
+    return True, None
 
 @st.cache_data(ttl=3600)
 def cached_plot_bpm_histogram(original_df, optimized_df):

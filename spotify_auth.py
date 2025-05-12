@@ -4,85 +4,171 @@ from spotipy.oauth2 import SpotifyOAuth
 import os
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
+
+# Spotify API credentials
+SPOTIPY_CLIENT_ID = os.getenv('SPOTIPY_CLIENT_ID')
+SPOTIPY_CLIENT_SECRET = os.getenv('SPOTIPY_CLIENT_SECRET')
+REDIRECT_URI = os.getenv('SPOTIPY_REDIRECT_URI', 'https://spotify-stringer.streamlit.app/')
+SCOPE = 'playlist-modify-public playlist-modify-private user-read-private user-read-email'
+
+def get_spotify_client():
+    """
+    Creates and returns a Spotify client with the proper authentication.
+    Centralizes client creation to prevent duplicate connection issues.
+    """
+    # Use cache_handler=None to avoid file permission issues in Streamlit cloud
+    auth_manager = SpotifyOAuth(
+        client_id=SPOTIPY_CLIENT_ID,
+        client_secret=SPOTIPY_CLIENT_SECRET,
+        redirect_uri=REDIRECT_URI,
+        scope=SCOPE,
+        cache_handler=None,
+        open_browser=False
+    )
+    
+    return spotipy.Spotify(auth_manager=auth_manager)
+
+def extract_playlist_tracks(playlist_id):
+    """
+    Extract tracks from a Spotify playlist.
+    
+    Args:
+        playlist_id: The ID of the Spotify playlist.
+        
+    Returns:
+        A list of tracks from the playlist.
+    """
+    try:
+        # Get a single Spotify client instance
+        sp = get_spotify_client()
+        
+        # Get playlist tracks
+        results = sp.playlist_tracks(playlist_id)
+        tracks = results['items']
+        
+        # Continue fetching if there are more tracks
+        while results['next']:
+            results = sp.next(results)
+            tracks.extend(results['items'])
+        
+        return tracks
+    except Exception as e:
+        st.error(f"Error fetching playlist: {e}")
+        return []
+
+def get_playlist_tracks(playlist_url):
+    """
+    Get tracks from a Spotify playlist URL.
+    
+    Args:
+        playlist_url: URL of the Spotify playlist.
+        
+    Returns:
+        A list of tracks from the playlist.
+    """
+    try:
+        # Validate playlist URL
+        if not playlist_url or "spotify.com/playlist/" not in playlist_url:
+            st.error("❌ Invalid playlist URL. Please provide a valid Spotify playlist URL.")
+            return []
+        
+        # Extract playlist ID
+        playlist_id = playlist_url.split("playlist/")[1].split("?")[0]
+        
+        # Fetch the tracks
+        tracks = extract_playlist_tracks(playlist_id)
+        
+        if not tracks:
+            st.warning("❌ No tracks found in this playlist or invalid playlist URL.")
+            return []
+            
+        return tracks
+    except Exception as e:
+        st.error(f"Error processing playlist: {str(e)}")
+        return []
 
 def authenticate_spotify():
     """
-    Authenticate with Spotify using OAuth
-    
-    Returns:
-        dict: {
-            'success': bool,
-            'message': str,
-            'spotify_client': spotipy.Spotify or None
-        }
+    Handle Spotify authentication flow.
+    Returns a dictionary with authentication status and client if successful.
     """
-    
-    try:
-        # Get credentials from environment variables (loaded from .env)
-        client_id = os.getenv("SPOTIPY_CLIENT_ID", "")
-        client_secret = os.getenv("SPOTIPY_CLIENT_SECRET", "")
-        redirect_uri = os.getenv("SPOTIPY_REDIRECT_URI", "http://localhost:8501")
-        
-        # If credentials not in environment, ask user
-        if not client_id or not client_secret:
-            with st.sidebar.expander("Spotify API Credentials"):
-                st.markdown("""
-                    To use this app, you need Spotify API credentials. 
-                    [Create a Spotify Developer account](https://developer.spotify.com/dashboard/) 
-                    and register an app to get these credentials.
-                """)
-                client_id = st.text_input("Client ID", value=client_id)
-                client_secret = st.text_input("Client Secret", value=client_secret, type="password")
-                redirect_uri = st.text_input("Redirect URI", value=redirect_uri)
-        
-        # Display message about credentials being loaded
-        else:
-            st.sidebar.info("✅ Spotify API credentials loaded from .env file")
-        
-        # Check if credentials are provided
-        if not client_id or not client_secret:
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        auth_url = None
+        try:
+            auth_manager = SpotifyOAuth(
+                client_id=SPOTIPY_CLIENT_ID,
+                client_secret=SPOTIPY_CLIENT_SECRET,
+                redirect_uri=REDIRECT_URI,
+                scope=SCOPE,
+                cache_handler=None,
+                open_browser=False
+            )
+            
+            # Check if we have a code in the URL
+            query_params = st.experimental_get_query_params()
+            if "code" in query_params:
+                code = query_params["code"][0]
+                st.session_state.token_info = auth_manager.get_access_token(code)
+                st.session_state.authenticated = True
+                # Clear URL parameters by redirecting
+                st.experimental_set_query_params()
+                st.experimental_rerun()
+            else:
+                auth_url = auth_manager.get_authorize_url()
+        except Exception as e:
             return {
                 'success': False,
-                'message': "Missing Spotify API credentials",
+                'message': f"Authentication error: {str(e)}",
                 'spotify_client': None
             }
         
-        # Define the scope for Spotify API access
-        scope = "playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public user-library-read"
-        
-        # Set up authentication manager
-        auth_manager = SpotifyOAuth(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri,
-            scope=scope,
-            cache_path=".spotify_cache"
-        )
-        
-        # Create Spotify client
-        spotify = spotipy.Spotify(auth_manager=auth_manager)
-        
-        # Test connection by getting current user info
+        if auth_url:
+            return {
+                'success': False,
+                'message': "Please authenticate with Spotify",
+                'auth_url': auth_url,
+                'spotify_client': None
+            }
+    else:
+        # Check if token needs refresh
         try:
-            user_info = spotify.current_user()
-            if user_info and isinstance(user_info, dict):
-                display_name = user_info.get('display_name', "Unknown User")
-            else:
-                display_name = "Unknown User"
-        except:
-            display_name = "Unknown User"
-        
-        return {
-            'success': True,
-            'message': f"Authenticated as {display_name}",
-            'spotify_client': spotify
-        }
-    
-    except Exception as e:
-        return {
-            'success': False,
-            'message': str(e),
-            'spotify_client': None
-        }
+            auth_manager = SpotifyOAuth(
+                client_id=SPOTIPY_CLIENT_ID,
+                client_secret=SPOTIPY_CLIENT_SECRET,
+                redirect_uri=REDIRECT_URI,
+                scope=SCOPE,
+                cache_handler=None,
+                open_browser=False
+            )
+            
+            if auth_manager.is_token_expired(st.session_state.token_info):
+                st.session_state.token_info = auth_manager.refresh_access_token(
+                    st.session_state.token_info['refresh_token']
+                )
+            
+            return {
+                'success': True,
+                'message': "Successfully authenticated with Spotify",
+                'spotify_client': get_spotify_client()
+            }
+        except Exception as e:
+            # If refresh fails, reset authentication
+            st.session_state.authenticated = False
+            return {
+                'success': False,
+                'message': f"Error refreshing token: {str(e)}",
+                'spotify_client': None
+            }
+
+if playlist_url and st.session_state['spotify_client']:
+    try:
+        # Validate playlist URL
+        is_valid, error_message = validate_playlist_url(playlist_url)
+        if not is_valid:
+            st.error(error_message)
+            st.stop()
