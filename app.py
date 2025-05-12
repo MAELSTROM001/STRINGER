@@ -63,9 +63,14 @@ st.set_page_config(
 
 # Apply custom CSS
 try:
-    local_css(".streamlit/style.css")
+    css_content = safe_load_file(".streamlit/style.css")
+    if css_content:
+        st.markdown(f'<style>{css_content}</style>', unsafe_allow_html=True)
+    else:
+        st.warning("Custom CSS file not found. Using default styling.")
 except Exception as e:
     log_error(e, "CSS loading")
+    st.warning("Failed to load custom CSS. Using default styling.")
 
 # Apply theme-based content styling
 if st.session_state['theme'] == 'dark':
@@ -288,7 +293,6 @@ def toggle_theme():
         st.session_state['theme'] = 'dark'
     else:
         st.session_state['theme'] = 'light'
-    st.rerun()
 
 # Function to close API alert
 def close_api_alert():
@@ -450,7 +454,8 @@ function theme_toggle() {{
 """, unsafe_allow_html=True)
 
 if st.sidebar.button("Toggle Theme", key="theme_toggle", on_click=toggle_theme, help=theme_tooltip):
-    pass  # The actual toggling happens in the on_click callback
+    # The theme will be updated on the next rerun
+    pass
 
 # Spotify authentication card with improved styling
 spotify_icon_color = sidebar_text if st.session_state['theme'] == 'light' else "rgba(255, 255, 255, 0.8)"
