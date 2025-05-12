@@ -1015,7 +1015,7 @@ def validate_playlist_url(url):
 is_valid, error_message = validate_playlist_url(playlist_url)
 if not is_valid:
     st.error(error_message)
-    return
+    
 
 @st.cache_data(ttl=3600)
 def cached_plot_bpm_histogram(original_df, optimized_df):
