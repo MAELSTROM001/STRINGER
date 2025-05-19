@@ -21,7 +21,7 @@ def get_spotify_client():
     # Get credentials from environment
     client_id = os.environ.get('SPOTIFY_CLIENT_ID')
     client_secret = os.environ.get('SPOTIFY_CLIENT_SECRET')
-    redirect_uri = "https://example.com/callback"
+    redirect_uri = "https://stringer-tool.streamlit.app/"
 
     # Create auth manager
     auth_manager = SpotifyOAuth(
