@@ -1,7 +1,8 @@
-streamlit==1.32.0
-pandas==2.2.0
-pyperclip==1.8.2
-python-dotenv==1.0.0
-plotly==5.18.0
+streamlit==1.32.2
 spotipy==2.23.0
-tenacity==8.2.3 
+pandas==2.0.3
+numpy==1.24.4
+matplotlib==3.7.4
+seaborn==0.13.1
+pillow==10.2.0
+python-dotenv==1.0.0
