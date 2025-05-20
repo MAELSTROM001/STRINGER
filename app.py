@@ -1,706 +1,1039 @@
 import streamlit as st
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from PIL import Image
-import io
-import base64
-import re
+import pyperclip
 import os
+import base64
 from dotenv import load_dotenv
-from config import load_env_variables
+from spotify_auth import authenticate_spotify, get_playlist_tracks
+from playlist_analyzer import get_audio_features, fetch_playlist_tracks
+from track_reorderer import reorder_tracks, get_recommendations
+from visualizations import plot_bpm_histogram, plot_key_wheel, plot_energy_valence
+from utils import (
+    validate_env_variables,
+    check_session_timeout,
+    safe_load_file,
+    cleanup_session_data,
+    validate_playlist_url,
+    safe_copy_to_clipboard,
+    log_error,
+    cached_plot_bpm_histogram
+)
+from spotify_utils import create_spotify_playlist
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential
+import logging
 
-# ===== Spotify Authentication and API Functions =====
+# Load environment variables from .env file
+load_dotenv()
 
+# Validate environment variables
+if not validate_env_variables():
+    st.stop()
 
-def get_spotify_client():
-    """Get an authenticated Spotify client using environment variables"""
-    # Get credentials from environment
-    client_id = os.environ.get('SPOTIFY_CLIENT_ID')
-    client_secret = os.environ.get('SPOTIFY_CLIENT_SECRET')
-    redirect_uri = "https://stringer-tool.streamlit.app/"
+# Initialize session state variables
+if 'spotify_client' not in st.session_state:
+    st.session_state['spotify_client'] = None
+if 'original_tracks' not in st.session_state:
+    st.session_state['original_tracks'] = None
+if 'optimized_tracks' not in st.session_state:
+    st.session_state['optimized_tracks'] = None
+if 'recommendations' not in st.session_state:
+    st.session_state['recommendations'] = None
+if 'theme' not in st.session_state:
+    st.session_state['theme'] = 'light'  # Default theme
+if 'show_api_alert' not in st.session_state:
+    st.session_state['show_api_alert'] = True  # For API credential alert
 
-    # Create auth manager
-    auth_manager = SpotifyOAuth(
-        client_id=client_id,
-        client_secret=client_secret,
-        redirect_uri=redirect_uri,
-        scope=
-        "playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public",
-        cache_path=".cache")
+# Helper function to load local SVG file and convert to base64
+def get_svg_base64(svg_file_path):
+    return safe_load_file(svg_file_path)
 
-    # Check if we have a valid token in cache
-    if 'token_info' in st.session_state:
-        token_info = st.session_state.token_info
-        # Check if token needs refresh
-        if auth_manager.is_token_expired(token_info):
-            try:
-                token_info = auth_manager.refresh_access_token(
-                    token_info['refresh_token'])
-                st.session_state.token_info = token_info
-            except:
-                st.session_state.pop('token_info', None)
-                st.sidebar.error("Session expired. Please log in again.")
-                token_info = None
+# Helper function to generate custom CSS
+def local_css(file_name):
+    css_content = safe_load_file(file_name)
+    if css_content:
+        st.markdown(f'<style>{css_content}</style>', unsafe_allow_html=True)
+
+# Page configuration
+st.set_page_config(
+    page_title="Strnger - Spotify Playlist Analyzer for DJs",
+    page_icon="🎧",
+    layout="wide"
+)
+
+# Apply custom CSS
+try:
+    css_content = safe_load_file(".streamlit/style.css")
+    if css_content:
+        st.markdown(f'<style>{css_content}</style>', unsafe_allow_html=True)
     else:
-        try:
-            token_info = auth_manager.get_cached_token()
-            if token_info:
-                st.session_state.token_info = token_info
-        except:
-            token_info = None
+        st.warning("Custom CSS file not found. Using default styling.")
+except Exception as e:
+    log_error(e, "CSS loading")
+    st.warning("Failed to load custom CSS. Using default styling.")
 
-    # If no valid token exists, show login button
-    if not token_info:
-        auth_url = auth_manager.get_authorize_url()
-        st.sidebar.markdown(f"### Spotify Authentication")
-        st.sidebar.markdown(f"[Login to Spotify]({auth_url})")
+# Apply theme-based content styling
+if st.session_state['theme'] == 'dark':
+    main_bg = "#121212"
+    main_text = "#FFFFFF"
+    main_container_bg = "rgba(30, 30, 30, 0.8)"
+    pattern_color = "rgba(232, 95, 52, 0.1)"
+    subtitle_color = "#BBBBBB"
+    card_bg = "rgba(50, 50, 50, 0.5)"
+    scrollbar_track = "#333333"
+else:
+    main_bg = "#FFFFFF"
+    main_text = "#333333"
+    main_container_bg = "rgba(255, 255, 255, 0.8)"
+    pattern_color = "rgba(232, 95, 52, 0.05)"
+    subtitle_color = "#444444"
+    card_bg = "rgba(232, 95, 52, 0.05)"
+    scrollbar_track = "#F1F1F1"
 
-        # Hidden input for redirect URL
-        redirect_url = st.sidebar.text_input("",
-                                             key="redirect_url_input",
-                                             label_visibility="collapsed")
+# Enhanced background and styling with HTML and theme support
+st.markdown(f"""
+<style>
+    /* Main container styles with theme awareness */
+    .main {{
+        background-color: {main_bg};
+        background-image: 
+            radial-gradient({pattern_color} 1px, transparent 1px),
+            radial-gradient({pattern_color} 1px, transparent 1px);
+        background-size: 30px 30px;
+        background-position: 0 0, 15px 15px;
+        color: {main_text};
+    }}
+    
+    .main .block-container {{
+        background-color: {main_container_bg};
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border-radius: 10px;
+        padding: 2rem;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+    }}
+    
+    /* Header and title styles */
+    .container {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1rem;
+        position: relative;
+    }}
+    
+    .logo {{
+        width: 80px;
+        margin-right: 20px;
+    }}
+    
+    .logo-container {{
+        display: flex;
+        align-items: center;
+    }}
+    
+    .title-text {{
+        color: #E85F34;
+        font-weight: 800 !important;
+        font-size: 3rem;
+        margin: 0;
+        letter-spacing: -1px;
+        text-shadow: 2px 2px 4px rgba(232, 95, 52, 0.1);
+    }}
+    
+    .subtitle {{
+        color: {subtitle_color};
+        font-weight: 300;
+        font-size: 1.2rem;
+        margin-top: 0.5rem;
+    }}
+    
+    /* Text highlight and accents */
+    .strnger-highlight {{
+        background: linear-gradient(135deg, #E85F34 0%, #F57C52 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: bold;
+    }}
+    
+    /* Input containers */
+    .playlist-url-input {{
+        border-left: 4px solid #E85F34;
+        padding: 1.5rem;
+        border-radius: 8px;
+        background-color: {card_bg};
+        margin-top: 2rem;
+        position: relative;
+        overflow: hidden;
+    }}
+    
+    .playlist-url-input::after {{
+        content: "";
+        position: absolute;
+        top: -50px;
+        right: -50px;
+        width: 100px;
+        height: 100px;
+        background: radial-gradient(circle, rgba(232, 95, 52, 0.15) 0%, rgba(232, 95, 52, 0) 70%);
+        border-radius: 50%;
+        z-index: 0;
+    }}
+    
+    /* Decorative elements */
+    .connector-line {{
+        height: 3px;
+        background: linear-gradient(90deg, #E85F34, #1DB954);
+        margin: 2rem 0;
+        border-radius: 3px;
+    }}
+    
+    /* Animations */
+    @keyframes fadeIn {{
+        from {{ opacity: 0; transform: translateY(10px); }}
+        to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    
+    .fadeIn {{
+        animation: fadeIn 0.5s ease-out forwards;
+    }}
+    
+    /* Scrollbar styling */
+    ::-webkit-scrollbar {{
+        width: 8px;
+        height: 8px;
+    }}
+    
+    ::-webkit-scrollbar-track {{
+        background: {scrollbar_track};
+        border-radius: 4px;
+    }}
+    
+    ::-webkit-scrollbar-thumb {{
+        background: linear-gradient(180deg, #E85F34, #F57C52);
+        border-radius: 4px;
+    }}
+    
+    ::-webkit-scrollbar-thumb:hover {{
+        background: linear-gradient(180deg, #D24A26, #E85F34);
+    }}
+    
+    /* Dark mode adjustments for standard Streamlit elements */
+    .stTextInput label, .stSelectbox label, .stSlider label {{
+        color: {main_text} !important;
+    }}
+    
+    .stDataFrame {{
+        background-color: {card_bg};
+        border-radius: 8px;
+        padding: 0.5rem;
+    }}
+    
+    .stMarkdown {{
+        color: {main_text};
+    }}
+    
+    h1, h2, h3, h4, h5, h6 {{
+        color: {main_text};
+    }}
+    
+    .main a {{
+        color: #E85F34 !important;
+    }}
+    
+    /* Button enhancements */
+    .stButton > button {{
+        border-radius: 30px !important;
+        transition: all 0.3s ease !important;
+    }}
+    
+    .stButton > button:hover {{
+        transform: translateY(-2px) !important;
+        box-shadow: 0 4px 12px rgba(232, 95, 52, 0.2) !important;
+    }}
+</style>
+""", unsafe_allow_html=True)
 
-        if redirect_url:
-            try:
-                code = auth_manager.parse_response_code(redirect_url)
-                if code != redirect_url:
-                    token_info = auth_manager.get_access_token(code)
-                    st.session_state.token_info = token_info
-                    st.rerun()
-            except:
-                st.sidebar.error("Authentication failed. Please try again.")
-                return None
+# Select the right logo based on theme
+if st.session_state['theme'] == 'dark':
+    header_logo_path = "images/strnger_logo_white.svg"
+else:
+    header_logo_path = "images/strnger_logo_transparent.svg"
+
+# App title with logo in flexbox container
+try:
+    header_logo_base64 = get_svg_base64(header_logo_path)
+    st.markdown(f"""
+    <div class="container">
+        <div class="logo-container">
+            <img src="{header_logo_base64}" class="logo">
+            <div>
+                <h1 class="title-text">STRNGER</h1>
+                <p class="subtitle">DJ-Style Playlist Organizer</p>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+except Exception as e:
+    # Fallback if the SVG loading fails
+    st.title("Strnger: DJ-Style Playlist Organizer")
+    st.write(f"Logo loading error: {str(e)}")
+
+# App description with styled text
+st.markdown("""
+    <p style="font-size: 1.1rem; line-height: 1.6; margin-bottom: 2rem;">
+    Analyze and reorder your Spotify playlists for <span class="strnger-highlight">optimal DJ-style flow</span> using BPM, 
+    musical key (Camelot wheel), energy progression, and other audio features.
+    </p>
+    <div class="connector-line"></div>
+""", unsafe_allow_html=True)
+
+# Function to toggle theme
+def toggle_theme():
+    if st.session_state['theme'] == 'light':
+        st.session_state['theme'] = 'dark'
     else:
-        # Show logout button if logged in
-        if st.sidebar.button("Logout from Spotify"):
-            # Clear cache and session state
-            try:
-                os.remove(".cache")
-            except:
-                pass
-            st.session_state.pop('token_info', None)
-            st.rerun()
+        st.session_state['theme'] = 'light'
 
-    # Return Spotify client if we have a token
-    if token_info:
-        try:
-            return spotipy.Spotify(auth=token_info['access_token'])
-        except:
-            return None
-    return None
+# Function to close API alert
+def close_api_alert():
+    st.session_state['show_api_alert'] = False
 
+# Apply theme-based styling
+if st.session_state['theme'] == 'dark':
+    sidebar_bg = "#121212"
+    sidebar_text = "#FFFFFF"
+    sidebar_card_bg = "rgba(255, 255, 255, 0.1)"
+    logo_path = "images/strnger_logo_white.svg"
+    theme_icon = "☀️"  # Sun for light mode toggle
+    theme_tooltip = "Switch to Light Mode"
+else:
+    sidebar_bg = "#F8F8F8"
+    sidebar_text = "#333333"
+    sidebar_card_bg = "rgba(232, 95, 52, 0.05)"
+    logo_path = "images/strnger_logo_transparent.svg"
+    theme_icon = "🌙"  # Moon for dark mode toggle
+    theme_tooltip = "Switch to Dark Mode"
 
-def extract_playlist_id(playlist_url):
-    """Extract playlist ID from Spotify URL"""
-    match = re.search(r'playlist/([a-zA-Z0-9]+)', playlist_url)
-    if match:
-        return match.group(1)
-    return None
+# Enhanced sidebar styling with theme support
+st.sidebar.markdown(f"""
+<style>
+    [data-testid="stSidebar"] {{
+        background-color: {sidebar_bg};
+    }}
+    .sidebar-header {{
+        font-size: 1.3rem;
+        font-weight: 600;
+        color: {sidebar_text};
+        margin-bottom: 1rem;
+    }}
+    .sidebar-card {{
+        background-color: {sidebar_card_bg};
+        border-radius: 8px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    }}
+    .sidebar-card-header {{
+        display: flex;
+        align-items: center;
+        margin-bottom: 0.5rem;
+    }}
+    .sidebar-card-header svg {{
+        margin-right: 0.5rem;
+    }}
+    .sidebar-card-title {{
+        color: {sidebar_text};
+        font-weight: 600;
+        margin: 0;
+    }}
+    .sidebar-card-content {{
+        color: {sidebar_text}cc;
+        font-size: 0.9rem;
+    }}
+    .auth-success {{
+        background-color: rgba(29, 185, 84, 0.2);
+        color: #1DB954;
+        padding: 0.5rem;
+        border-radius: 4px;
+        display: flex;
+        align-items: center;
+        margin-top: 0.5rem;
+    }}
+    .auth-error {{
+        background-color: rgba(232, 95, 52, 0.2);
+        color: #E85F34;
+        padding: 0.5rem;
+        border-radius: 4px;
+        display: flex;
+        align-items: center;
+        margin-top: 0.5rem;
+    }}
+    .theme-toggle {{
+        display: flex;
+        justify-content: center;
+        margin-top: 2rem;
+    }}
+    .theme-toggle button {{
+        background-color: {sidebar_card_bg};
+        color: {sidebar_text};
+        border: none;
+        border-radius: 20px;
+        padding: 8px 16px;
+        font-size: 1rem;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        transition: all 0.3s ease;
+    }}
+    .theme-toggle button:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    }}
+    .theme-icon {{
+        margin-right: 8px;
+        font-size: 1.2rem;
+    }}
+    .api-alert {{
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 1000;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        background-color: white;
+        border-left: 4px solid #E85F34;
+        max-width: 300px;
+        animation: slideIn 0.5s forwards;
+    }}
+    .close-button {{
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        background: none;
+        border: none;
+        color: #888;
+        cursor: pointer;
+        font-size: 1.2rem;
+    }}
+    @keyframes slideIn {{
+        from {{ transform: translateX(100%); opacity: 0; }}
+        to {{ transform: translateX(0); opacity: 1; }}
+    }}
+</style>
+""", unsafe_allow_html=True)
 
+# Authenticate with Spotify
+try:
+    logo_base64 = get_svg_base64(logo_path)
+    st.sidebar.markdown(f"""
+    <div style="display: flex; align-items: center; margin-bottom: 2rem;">
+        <img src="{logo_base64}" style="width: 40px; margin-right: 10px;">
+        <span class="sidebar-header">STRNGER</span>
+    </div>
+    """, unsafe_allow_html=True)
+except:
+    st.sidebar.header("STRNGER")
 
-def get_playlist_tracks(sp, playlist_id):
-    """Get all tracks from a playlist"""
-    results = sp.playlist_tracks(playlist_id)
-    tracks = results['items']
-    while results['next']:
-        results = sp.next(results)
-        tracks.extend(results['items'])
-    return tracks
+# Add theme toggle button
+st.sidebar.markdown(f"""
+<div class="theme-toggle">
+    <button onclick="theme_toggle()">
+        <span class="theme-icon">{theme_icon}</span>
+        {theme_tooltip}
+    </button>
+</div>
 
+<script>
+function theme_toggle() {{
+    const form = window.parent.document.querySelector('form[data-testid="stForm"]');
+    const button = form.querySelector('button[data-testid="stFormSubmitButton"]');
+    button.click();
+}}
+</script>
+""", unsafe_allow_html=True)
 
-def get_audio_features(sp, track_ids):
-    """Get audio features for a list of track IDs"""
-    audio_features = []
-    # Process in batches of 100 (API limit)
-    for i in range(0, len(track_ids), 100):
-        batch = track_ids[i:i + 100]
-        audio_features.extend(sp.audio_features(batch))
-    return audio_features
+if st.sidebar.button("Toggle Theme", key="theme_toggle", on_click=toggle_theme, help=theme_tooltip):
+    # The theme will be updated on the next rerun
+    pass
 
+# Spotify authentication card with improved styling
+spotify_icon_color = sidebar_text if st.session_state['theme'] == 'light' else "rgba(255, 255, 255, 0.8)"
+st.sidebar.markdown(f"""
+<div class="sidebar-card">
+    <div class="sidebar-card-header">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+            <path d="M12 0C5.4 0 0 5.4 0 12C0 18.6 5.4 24 12 24C18.6 24 24 18.6 24 12C24 5.4 18.66 0 12 0Z" fill="{spotify_icon_color}"/>
+            <path d="M17.521 17.34C17.281 17.699 16.82 17.82 16.46 17.58C13.62 15.84 10.14 15.479 5.939 16.439C5.521 16.56 5.16 16.26 5.04 15.9C4.92 15.48 5.22 15.12 5.58 15C10.14 13.979 13.98 14.4 17.16 16.38C17.58 16.56 17.64 17.04 17.521 17.34Z" fill="#1DB954"/>
+            <path d="M18.961 14.04C18.66 14.46 18.12 14.64 17.7 14.34C14.46 12.36 9.54 11.76 5.76 12.96C5.34 13.08 4.74 12.84 4.62 12.42C4.5 12 4.74 11.4 5.16 11.28C9.6 9.9 15 10.56 18.72 12.84C19.081 13.02 19.261 13.62 18.961 14.04Z" fill="#1DB954"/>
+            <path d="M19.081 10.68C15.24 8.4 8.82 8.16 5.16 9.301C4.62 9.48 4.08 9.12 3.9 8.64C3.72 8.1 4.08 7.56 4.56 7.38C8.82 6.12 15.84 6.36 20.28 8.94C20.76 9.18 20.94 9.78 20.7 10.26C20.52 10.56 19.92 10.92 19.081 10.68Z" fill="#1DB954"/>
+        </svg>
+        <h3 class="sidebar-card-title">Spotify Authentication</h3>
+    </div>
+    <p class="sidebar-card-content">
+        Connect to your Spotify account to analyze playlists and create optimized versions
+    </p>
+    <div id="auth-message"></div>
+</div>
+""", unsafe_allow_html=True)
 
-# ===== Music Theory and DJ Logic =====
+auth_message = st.sidebar.empty()
 
-
-def get_camelot_number(key, mode):
-    """Convert Spotify key and mode to Camelot wheel notation"""
-    camelot_map = {
-        (0, 1): "8B",  # C Major
-        (1, 1): "3B",  # C#/Db Major
-        (2, 1): "10B",  # D Major
-        (3, 1): "5B",  # D#/Eb Major
-        (4, 1): "12B",  # E Major
-        (5, 1): "7B",  # F Major
-        (6, 1): "2B",  # F#/Gb Major
-        (7, 1): "9B",  # G Major
-        (8, 1): "4B",  # G#/Ab Major
-        (9, 1): "11B",  # A Major
-        (10, 1): "6B",  # A#/Bb Major
-        (11, 1): "1B",  # B Major
-        (0, 0): "5A",  # C Minor
-        (1, 0): "12A",  # C#/Db Minor
-        (2, 0): "7A",  # D Minor
-        (3, 0): "2A",  # D#/Eb Minor
-        (4, 0): "9A",  # E Minor
-        (5, 0): "4A",  # F Minor
-        (6, 0): "11A",  # F#/Gb Minor
-        (7, 0): "6A",  # G Minor
-        (8, 0): "1A",  # G#/Ab Minor
-        (9, 0): "8A",  # A Minor
-        (10, 0): "3A",  # A#/Bb Minor
-        (11, 0): "10A"  # B Minor
-    }
-    return camelot_map.get((key, mode), "??")
-
-
-def get_key_name(key, mode):
-    """Convert Spotify key and mode to conventional key names"""
-    key_names = [
-        "C", "C♯/D♭", "D", "D♯/E♭", "E", "F", "F♯/G♭", "G", "G♯/A♭", "A",
-        "A♯/B♭", "B"
-    ]
-    mode_names = ["minor", "major"]
-    return f"{key_names[key]} {mode_names[mode]}"
-
-
-def calculate_transition_score(track1, track2):
-    """Calculate a transition score between two tracks (lower is better)"""
-    # Extract camelot numbers
-    camelot1 = track1['camelot']
-    camelot2 = track2['camelot']
-
-    # Parse camelot notation
-    num1 = int(camelot1[:-1])
-    letter1 = camelot1[-1]
-    num2 = int(camelot2[:-1])
-    letter2 = camelot2[-1]
-
-    # Calculate key compatibility score (lower is better)
-    key_score = 10  # Default high score
-
-    # Perfect match
-    if camelot1 == camelot2:
-        key_score = 0
-    # Adjacent on camelot wheel (same letter)
-    elif letter1 == letter2 and (num1 == num2 + 1 or num1 == num2 - 1
-                                 or num1 == 12 and num2 == 1
-                                 or num1 == 1 and num2 == 12):
-        key_score = 1
-    # Relative major/minor
-    elif (letter1 == 'A' and letter2 == 'B'
-          or letter1 == 'B' and letter2 == 'A') and ((num1 == num2 + 3) % 12 or
-                                                     (num2 == num1 + 3) % 12):
-        key_score = 2
-
-    # BPM compatibility (target is within 5-10% for smooth transition)
-    bpm1 = track1['tempo']
-    bpm2 = track2['tempo']
-
-    bpm_ratio = max(bpm1, bpm2) / min(bpm1, bpm2)
-
-    # Perfect BPM match
-    if abs(bpm1 - bpm2) < 3:
-        bpm_score = 0
-    # Within 6% (good for beatmatching)
-    elif bpm_ratio <= 1.06:
-        bpm_score = 1
-    # Within 12% (possible with pitch adjustment)
-    elif bpm_ratio <= 1.12:
-        bpm_score = 3
-    # Bigger difference
+if st.session_state['spotify_client'] is None:
+    auth_status = authenticate_spotify()
+    if auth_status['success']:
+        st.session_state['spotify_client'] = auth_status['spotify_client']
+        auth_message.markdown("""
+        <div class="auth-success">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style="margin-right: 8px;">
+                <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM10 17L5 12L6.41 10.59L10 14.17L17.59 6.58L19 8L10 17Z" fill="#1DB954"/>
+            </svg>
+            Successfully connected to Spotify
+        </div>
+        """, unsafe_allow_html=True)
     else:
-        bpm_score = 5
+        auth_message.markdown(f"""
+        <div class="auth-error">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style="margin-right: 8px;">
+                <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM13 17H11V15H13V17ZM13 13H11V7H13V13Z" fill="#E85F34"/>
+            </svg>
+            Authentication failed: {auth_status['message']}
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Show API credentials alert as a popup that can be dismissed
+        if st.session_state['show_api_alert'] and "Missing Spotify API credentials" in auth_status['message']:
+            st.markdown(f"""
+            <div class="api-alert">
+                <button class="close-button" onclick="close_api_alert()">×</button>
+                <h4 style="margin-top: 0; color: #E85F34;">API Credentials Required</h4>
+                <p style="font-size: 0.9rem;">
+                    To use this app, you'll need to add your Spotify API credentials in the sidebar.
+                    <a href="https://developer.spotify.com/dashboard/" target="_blank">Create a Spotify Developer account</a>
+                    to get these credentials.
+                </p>
+            </div>
+            
+            <script>
+            function close_api_alert() {{
+                const form = window.parent.document.querySelector('form[data-testid="stForm"]');
+                const closeButton = form.querySelector('button[data-testid="stFormSubmitButton"][aria-label="close_alert"]');
+                closeButton.click();
+                
+                // Also hide the alert immediately for better UX
+                const alert = window.parent.document.querySelector('.api-alert');
+                if (alert) alert.style.display = 'none';
+            }}
+            </script>
+            """, unsafe_allow_html=True)
+            
+            # Hidden button to handle API alert closing
+            if st.button("Close Alert", key="close_alert", on_click=close_api_alert, help="Close the API credentials alert"):
+                pass  # The actual closing happens in the on_click callback
+else:
+    auth_message.markdown("""
+    <div class="auth-success">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style="margin-right: 8px;">
+            <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM10 17L5 12L6.41 10.59L10 14.17L17.59 6.58L19 8L10 17Z" fill="#1DB954"/>
+        </svg>
+        Connected to Spotify
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Energy and valence transition (smaller changes preferred)
-    energy_score = abs(track1['energy'] - track2['energy']) * 3
-    valence_score = abs(track1['valence'] - track2['valence']) * 2
+# Playlist URL input with styled container
+st.markdown("""
+<div class="playlist-url-input">
+    <h3 style="margin-top: 0; margin-bottom: 1rem; color: #333;">Enter a Spotify Playlist URL</h3>
+    <p style="color: #666; margin-bottom: 1rem; font-size: 0.9rem;">
+        Paste the URL of any Spotify playlist you want to analyze and optimize for DJ-style flow
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
-    # Calculate final score (weighted sum)
-    total_score = key_score * 3 + bpm_score * 2 + energy_score + valence_score
+playlist_url = st.text_input(
+    "Spotify Playlist URL", 
+    placeholder="https://open.spotify.com/playlist/...",
+    help="The URL of a Spotify playlist you want to analyze and reorder",
+    label_visibility="collapsed"
+)
 
-    return total_score
+# Display Spotify icon before URL if entered
+if playlist_url:
+    playlist_display = playlist_url
+    if len(playlist_display) > 60:
+        playlist_display = playlist_display[:57] + "..."
+    
+    st.markdown(f"""
+    <div style="display: flex; align-items: center; background-color: rgba(29, 185, 84, 0.1); 
+                padding: 0.5rem 1rem; border-radius: 4px; margin-bottom: 1rem;">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style="margin-right: 10px;">
+            <path d="M12 0C5.4 0 0 5.4 0 12C0 18.6 5.4 24 12 24C18.6 24 24 18.6 24 12C24 5.4 18.66 0 12 0ZM17.521 17.34C17.281 17.699 16.82 17.82 16.46 17.58C13.62 15.84 10.14 15.479 5.939 16.439C5.521 16.56 5.16 16.26 5.04 15.9C4.92 15.48 5.22 15.12 5.58 15C10.14 13.979 13.98 14.4 17.16 16.38C17.58 16.56 17.64 17.04 17.521 17.34ZM18.961 14.04C18.66 14.46 18.12 14.64 17.7 14.34C14.46 12.36 9.54 11.76 5.76 12.96C5.34 13.08 4.74 12.84 4.62 12.42C4.5 12 4.74 11.4 5.16 11.28C9.6 9.9 15 10.56 18.72 12.84C19.081 13.02 19.261 13.62 18.961 14.04ZM19.081 10.68C15.24 8.4 8.82 8.16 5.16 9.301C4.62 9.48 4.08 9.12 3.9 8.64C3.72 8.1 4.08 7.56 4.56 7.38C8.82 6.12 15.84 6.36 20.28 8.94C20.76 9.18 20.94 9.78 20.7 10.26C20.52 10.56 19.92 10.92 19.081 10.68Z" 
+                  fill="#1DB954"/>
+        </svg>
+        <span style="color: #1DB954; font-weight: 500;">{playlist_display}</span>
+    </div>
+    """, unsafe_allow_html=True)
 
-
-def optimize_playlist(tracks_df):
-    """Reorder tracks for optimal DJ flow with progress tracking for large playlists"""
-    # Make a copy of the dataframe to work with
-    df = tracks_df.copy()
-
-    # Create a progress bar if there are many tracks
-    total_tracks = len(df)
-    show_progress = total_tracks > 30
-
-    # Initialize progress tracking elements
-    progress_bar = None
-    progress_text = None
-    calc_progress = None
-
-    if show_progress:
-        progress_bar = st.progress(0)
-        progress_text = st.empty()
-        if progress_text is not None:
-            progress_text.text(
-                f"Optimizing playlist (0/{total_tracks-1} tracks processed)..."
-            )
-
-    # Start with the first track
-    optimized_order = [0]  # Start with first track's index
-    remaining_indices = set(range(1, total_tracks))
-
-    # Pre-calculate scores for large playlists to improve performance
-    score_cache = {}  # Initialize score cache for all playlist sizes
-
-    if total_tracks > 50:
-        # For large playlists, calculate and store all pairwise scores once
-        # This avoids repeated calculations and significantly speeds up the algorithm
-
-        # Show a progress indicator for score calculation
-        if show_progress and progress_text is not None:
-            progress_text.text(
-                "Pre-calculating transition scores for faster optimization...")
-            calc_progress = st.progress(0)
-            total_calcs = (total_tracks * (total_tracks - 1)) // 2
-            completed_calcs = 0
-
-        for i in range(total_tracks):
-            track_i = df.iloc[i]
-            for j in range(i + 1, total_tracks):
-                track_j = df.iloc[j]
-                score = calculate_transition_score(track_i, track_j)
-                score_cache[(i, j)] = score
-                score_cache[(j, i)] = score
-
-                # Update progress for large playlists
-                if show_progress and total_tracks > 100:
-                    completed_calcs = completed_calcs + 1
-                    if completed_calcs % 100 == 0:  # Update every 100 calculations to avoid slowdown
-                        if calc_progress is not None and total_calcs > 0:
-                            calc_progress.progress(
-                                min(completed_calcs / total_calcs, 1.0))
-
-        if show_progress and total_tracks > 100 and calc_progress is not None:
-            calc_progress.empty()
-
-    # Greedily select the next best track based on transition score
-    for step in range(len(remaining_indices)):
-        last_track_idx = optimized_order[-1]
-        last_track = df.iloc[last_track_idx]
-
-        # Find the best next track
-        best_score = float('inf')
-        best_idx = -1
-
-        for idx in remaining_indices:
-            # Use cached score if available (for large playlists)
-            if total_tracks > 50 and (last_track_idx, idx) in score_cache:
-                score = score_cache[(last_track_idx, idx)]
-            else:
-                next_track = df.iloc[idx]
-                score = calculate_transition_score(last_track, next_track)
-
-            if score < best_score:
-                best_score = score
-                best_idx = idx
-
-        # Add the best track to our order and remove from remaining
-        optimized_order.append(best_idx)
-        remaining_indices.remove(best_idx)
-
-        # Update progress bar for large playlists
-        if show_progress and (step % max(1, total_tracks // 100) == 0
-                              or step == len(remaining_indices) - 1):
-            if progress_bar is not None:
-                progress_bar.progress((step + 1) / (total_tracks - 1))
-            if progress_text is not None:
-                progress_text.text(
-                    f"Optimizing playlist ({step+1}/{total_tracks-1} tracks processed)..."
-                )
-
-    # Create a new dataframe with optimized order
-    optimized_df = df.iloc[optimized_order].copy()
-    optimized_df['optimized_position'] = range(1, len(optimized_df) + 1)
-
-    # Clear progress indicators when done
-    if show_progress:
-        if progress_text is not None:
-            progress_text.empty()
-        if progress_bar is not None:
-            progress_bar.empty()
-        st.success(
-            f"✅ Successfully optimized playlist with {total_tracks} tracks!")
-
-    return optimized_df
-
-
-def get_recommendations(sp, seed_track_id, target_bpm, target_key,
-                        target_energy, target_valence):
-    """Get track recommendations to bridge between two tracks"""
+# Process playlist when URL is provided
+if playlist_url and st.session_state['spotify_client']:
     try:
-        recommendations = sp.recommendations(seed_tracks=[seed_track_id],
-                                             limit=5,
-                                             target_tempo=target_bpm,
-                                             target_key=target_key,
-                                             target_energy=target_energy,
-                                             target_valence=target_valence)
-        return recommendations['tracks']
-    except:
-        return []
+        # Validate playlist URL
+        is_valid, error_message = validate_playlist_url(playlist_url)
+        if not is_valid:
+            st.error(error_message)
+            st.stop()
 
+        # Check session timeout
+        if not check_session_timeout():
+            st.stop()
 
-def find_transition_gaps(optimized_df, threshold=7.0):
-    """Find transitions that might need bridge tracks"""
-    gaps = []
-
-    for i in range(len(optimized_df) - 1):
-        track1 = optimized_df.iloc[i]
-        track2 = optimized_df.iloc[i + 1]
-
-        score = calculate_transition_score(track1, track2)
-
-        if score > threshold:
-            gaps.append((i, i + 1, score))
-
-    return gaps
-
-
-# ===== Visualization Functions =====
-
-
-def plot_bpm_distribution(tracks_df):
-    """Create a histogram of track tempos"""
-    fig, ax = plt.subplots(figsize=(10, 4))
-    sns.histplot(tracks_df['tempo'], bins=15, kde=True, ax=ax)
-    ax.set_title('BPM Distribution')
-    ax.set_xlabel('Tempo (BPM)')
-    ax.set_ylabel('Number of Tracks')
-    return fig
-
-
-def plot_camelot_wheel(tracks_df):
-    """Create a visualization of tracks on the Camelot wheel"""
-    # Create a blank wheel image
-    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': 'polar'})
-
-    # Count tracks in each camelot position
-    camelot_counts = tracks_df['camelot'].value_counts().reset_index()
-    camelot_counts.columns = ['camelot', 'count']
-
-    # Set up the wheel
-    ax.set_theta_zero_location("N")
-    ax.set_theta_direction(-1)
-    ax.set_xticks(np.pi / 6 * np.arange(12))
-    ax.set_xticklabels([])
-
-    # Add the Camelot numbers
-    for i in range(12):
-        angle = np.pi / 6 * i
-        ax.text(angle, 1.2, f"{i + 1}B", ha='center', va='center', fontsize=12)
-        ax.text(angle, 0.8, f"{i + 1}A", ha='center', va='center', fontsize=12)
-
-    # Plot each camelot position
-    for _, row in camelot_counts.iterrows():
-        camelot = row['camelot']
-        count = row['count']
-
-        # Parse camelot notation
-        if len(camelot) >= 2:
-            try:
-                num = int(camelot[:-1]) - 1  # Convert to 0-indexed
-                letter = camelot[-1]
-
-                # Calculate position
-                angle = np.pi / 6 * num
-                radius = 1.0 if letter == 'B' else 0.6
-
-                # Draw a point
-                ax.scatter(angle, radius, s=count * 100, alpha=0.7)
-
-                # Add label
-                ax.text(angle, radius, str(count), ha='center', va='center')
-            except:
-                continue
-
-    ax.set_title('Track Distribution on Camelot Wheel')
-    ax.grid(True)
-    return fig
-
-
-def get_table_download_link(df,
-                            filename="stringer_playlist.csv",
-                            text="Download as CSV"):
-    """Generate a link to download the dataframe as a CSV file"""
-    csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()
-    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">{text}</a>'
-    return href
-
-
-# ===== Main App =====
-
-
-def main():
-    st.set_page_config(page_title="Stringer - Spotify Playlist Optimizer",
-                       page_icon="🎧",
-                       layout="wide")
-
-    st.title("🎧 Stringer: Spotify Playlist Optimizer")
-    st.markdown("""
-    Optimize your Spotify playlists for DJ-style flow based on BPM, musical key, energy, and valence.
-    Perfect for creating smooth transitions between tracks!
-    """)
-
-    # Initialize session state
-    if 'optimized_df' not in st.session_state:
-        st.session_state.optimized_df = None
-
-    if 'original_df' not in st.session_state:
-        st.session_state.original_df = None
-
-    # Attempt to authenticate with Spotify
-    sp = get_spotify_client()
-
-    # Only continue if we have a valid Spotify connection
-    if not sp:
-        st.warning("Please log in to Spotify using the sidebar to continue.")
-        return
-
-    # Main content area
-    st.markdown("### Enter your Spotify playlist URL")
-    playlist_url = st.text_input(
-        "Spotify Playlist URL",
-        placeholder="https://open.spotify.com/playlist/...")
-
-    if playlist_url:
-        playlist_id = extract_playlist_id(playlist_url)
-
-        if not playlist_id:
-            st.error(
-                "Invalid Spotify playlist URL. Please check the URL and try again."
-            )
-            return
-
-        with st.spinner("Fetching playlist data..."):
-            try:
-                # Get playlist information
-                playlist_info = sp.playlist(playlist_id)
-                playlist_name = playlist_info['name']
-                playlist_owner = playlist_info['owner']['display_name']
-                total_tracks = playlist_info['tracks']['total']
-
-                st.success(
-                    f"Found playlist: **{playlist_name}** by *{playlist_owner}* with {total_tracks} tracks"
-                )
-
-                # Get all tracks from the playlist
-                tracks = get_playlist_tracks(sp, playlist_id)
-
-                # Extract track IDs and other info
-                track_data = []
-                track_ids = []
-
-                for i, item in enumerate(tracks):
-                    if item['track']:
-                        track = item['track']
-                        track_ids.append(track['id'])
-
-                        artists = ", ".join(
-                            [artist['name'] for artist in track['artists']])
-
-                        track_data.append({
-                            'position': i + 1,
-                            'name': track['name'],
-                            'artist': artists,
-                            'spotify_uri': track['uri'],
-                            'id': track['id'],
-                            'duration_ms': track['duration_ms']
-                        })
-
-                # Get audio features for all tracks
+        with st.spinner("Fetching playlist tracks..."):
+            # Fetch and analyze playlist
+            tracks = get_playlist_tracks(playlist_url)
+            
+            if not tracks:
+                st.error("❌ No tracks found in this playlist or invalid playlist URL.")
+            else:
+                playlist_name = tracks[0].get('playlist_name', 'Playlist')
+                st.success(f"✅ Successfully loaded '{playlist_name}' with {len(tracks)} tracks")
+                
+                # Get audio features for the tracks
                 with st.spinner("Analyzing audio features..."):
-                    audio_features = get_audio_features(sp, track_ids)
+                    tracks_with_features = get_audio_features(st.session_state['spotify_client'], tracks)
+                    st.session_state['original_tracks'] = tracks_with_features
+                    
+                    # Clean up session data if needed
+                    cleanup_session_data()
+                    
+                    # Reorder tracks
+                    st.session_state['optimized_tracks'] = reorder_tracks(tracks_with_features)
+                    
+                    # Get recommendations for gaps
+                    st.session_state['recommendations'] = get_recommendations(
+                        st.session_state['spotify_client'], 
+                        st.session_state['optimized_tracks']
+                    )
+    except Exception as e:
+        log_error(e, "Playlist processing")
 
-                    # Combine track data with audio features
-                    for i, features in enumerate(audio_features):
-                        if features:
-                            track_data[i]['tempo'] = round(
-                                features['tempo'], 1)
-                            track_data[i]['key'] = features['key']
-                            track_data[i]['mode'] = features['mode']
-                            track_data[i]['energy'] = features['energy']
-                            track_data[i]['danceability'] = features[
-                                'danceability']
-                            track_data[i]['valence'] = features['valence']
-                            track_data[i]['camelot'] = get_camelot_number(
-                                features['key'], features['mode'])
-                            track_data[i]['key_name'] = get_key_name(
-                                features['key'], features['mode'])
+# Display results if data is available
+if st.session_state['original_tracks'] is not None and st.session_state['optimized_tracks'] is not None:
+    # Convert to DataFrames for display
+    original_df = pd.DataFrame(st.session_state['original_tracks'])
+    optimized_df = pd.DataFrame(st.session_state['optimized_tracks'])
+    
+    # Create tabs for different views with enhanced styling
+    st.markdown("""
+    <style>
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 8px 8px 0 0;
+            padding: 10px 20px;
+            font-weight: 500;
+            background-color: #f0f0f0;
+            border: none;
+        }
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(135deg, #E85F34 0%, #F57C52 100%) !important;
+            color: white !important;
+        }
+        .stTabs [data-baseweb="tab-panel"] {
+            background-color: white;
+            border-radius: 0 8px 8px 8px;
+            border: 1px solid #f0f0f0;
+            padding: 1.5rem;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Original Playlist", 
+        "Optimized Playlist", 
+        "Visualizations", 
+        "Recommendations"
+    ])
+    
+    with tab1:
+        st.header("Original Playlist")
+        st.dataframe(
+            original_df[['position', 'name', 'artists', 'tempo', 'key_name', 'energy', 'valence']],
+            column_config={
+                'position': st.column_config.NumberColumn('Position', format="%d"),
+                'name': st.column_config.TextColumn('Track'),
+                'artists': st.column_config.TextColumn('Artists'),
+                'tempo': st.column_config.NumberColumn('BPM', format="%.1f"),
+                'key_name': st.column_config.TextColumn('Key'),
+                'energy': st.column_config.ProgressColumn('Energy', format="%.2f", min_value=0, max_value=1),
+                'valence': st.column_config.ProgressColumn('Positivity', format="%.2f", min_value=0, max_value=1)
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+    
+    with tab2:
+        st.header("DJ-Optimized Playlist")
+        st.dataframe(
+            optimized_df[['new_position', 'name', 'artists', 'tempo', 'key_name', 'energy', 'valence', 'transition_score']],
+            column_config={
+                'new_position': st.column_config.NumberColumn('Position', format="%d"),
+                'name': st.column_config.TextColumn('Track'),
+                'artists': st.column_config.TextColumn('Artists'),
+                'tempo': st.column_config.NumberColumn('BPM', format="%.1f"),
+                'key_name': st.column_config.TextColumn('Key'),
+                'energy': st.column_config.ProgressColumn('Energy', format="%.2f", min_value=0, max_value=1),
+                'valence': st.column_config.ProgressColumn('Positivity', format="%.2f", min_value=0, max_value=1),
+                'transition_score': st.column_config.ProgressColumn('Transition Score', format="%.2f", min_value=0, max_value=5)
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        # Enhanced action panel with styled buttons
+        st.markdown("""
+        <style>
+            .action-panel {
+                background-color: rgba(232, 95, 52, 0.05);
+                border-radius: 8px;
+                padding: 1.5rem;
+                margin-top: 2rem;
+                border-left: 4px solid #E85F34;
+            }
+            .action-panel-title {
+                font-size: 1.2rem;
+                font-weight: 600;
+                color: #333;
+                margin-bottom: 1rem;
+            }
+            .strnger-button {
+                background: linear-gradient(135deg, #E85F34 0%, #F57C52 100%);
+                color: white;
+                padding: 12px 24px;
+                border-radius: 30px;
+                border: none;
+                font-weight: 600;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.3s ease;
+                box-shadow: 0 4px 12px rgba(232, 95, 52, 0.2);
+                margin-right: 10px;
+            }
+            .strnger-button:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 6px 16px rgba(232, 95, 52, 0.3);
+            }
+            .spotify-button {
+                background: linear-gradient(135deg, #1DB954 0%, #1ED760 100%);
+                color: white;
+                padding: 12px 24px;
+                border-radius: 30px;
+                border: none;
+                font-weight: 600;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.3s ease;
+                box-shadow: 0 4px 12px rgba(29, 185, 84, 0.2);
+            }
+            .spotify-button:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 6px 16px rgba(29, 185, 84, 0.3);
+            }
+            .button-icon {
+                margin-right: 8px;
+            }
+            .playlist-name-input {
+                margin-bottom: 1rem;
+            }
+        </style>
+        <div class="action-panel">
+            <h3 class="action-panel-title">Export Your Optimized Playlist</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Copy to clipboard and create playlist buttons
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            playlist_name = st.text_input("New Playlist Name", 
+                                         value=f"DJ-Optimized: {original_df['playlist_name'].iloc[0]}" if 'playlist_name' in original_df.columns else "DJ-Optimized Playlist",
+                                         help="Enter a name for your new optimized playlist")
+        
+        with col2:
+            st.markdown("<div style='height: 30px'></div>", unsafe_allow_html=True)  # Vertical spacing
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📋 Copy Track URIs to Clipboard", use_container_width=True):
+                track_uris = [track['uri'] for track in st.session_state['optimized_tracks']]
+                safe_copy_to_clipboard(track_uris)
+                
+        with col2:
+            if st.button("🎧 Create Spotify Playlist", use_container_width=True, type="primary"):
+                with st.spinner("Creating playlist..."):
+                    track_uris = [track['uri'] for track in st.session_state['optimized_tracks']]
+                    result = create_spotify_playlist(st.session_state['spotify_client'], playlist_name, track_uris)
+                    
+                    if result['success']:
+                        st.markdown(f"""
+                        <div style="background-color: rgba(29, 185, 84, 0.1); padding: 1rem; border-radius: 8px; margin-top: 1rem; border-left: 4px solid #1DB954;">
+                            <div style="display: flex; align-items: center; margin-bottom: 0.5rem;">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style="margin-right: 10px;">
+                                    <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM10 17L5 12L6.41 10.59L10 14.17L17.59 6.58L19 8L10 17Z" fill="#1DB954"/>
+                                </svg>
+                                <span style="font-weight: 600; font-size: 1.1rem; color: #1DB954;">Playlist Created Successfully!</span>
+                            </div>
+                            <p style="margin: 0 0 0.5rem 0;">Your optimized playlist has been created on your Spotify account.</p>
+                            <a href="{result['link']}" target="_blank" style="display: inline-flex; align-items: center; background-color: #1DB954; color: white; padding: 8px 16px; border-radius: 20px; text-decoration: none; font-weight: 500;">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style="margin-right: 8px;">
+                                    <path d="M12 0C5.4 0 0 5.4 0 12C0 18.6 5.4 24 12 24C18.6 24 24 18.6 24 12C24 5.4 18.66 0 12 0Z" fill="white"/>
+                                    <path d="M17.521 17.34C17.281 17.699 16.82 17.82 16.46 17.58C13.62 15.84 10.14 15.479 5.939 16.439C5.521 16.56 5.16 16.26 5.04 15.9C4.92 15.48 5.22 15.12 5.58 15C10.14 13.979 13.98 14.4 17.16 16.38C17.58 16.56 17.64 17.04 17.521 17.34Z" fill="#1DB954"/>
+                                    <path d="M18.961 14.04C18.66 14.46 18.12 14.64 17.7 14.34C14.46 12.36 9.54 11.76 5.76 12.96C5.34 13.08 4.74 12.84 4.62 12.42C4.5 12 4.74 11.4 5.16 11.28C9.6 9.9 15 10.56 18.72 12.84C19.081 13.02 19.261 13.62 18.961 14.04Z" fill="#1DB954"/>
+                                    <path d="M19.081 10.68C15.24 8.4 8.82 8.16 5.16 9.301C4.62 9.48 4.08 9.12 3.9 8.64C3.72 8.1 4.08 7.56 4.56 7.38C8.82 6.12 15.84 6.36 20.28 8.94C20.76 9.18 20.94 9.78 20.7 10.26C20.52 10.56 19.92 10.92 19.081 10.68Z" fill="#1DB954"/>
+                                </svg>
+                                Open in Spotify
+                            </a>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.error(f"❌ Failed to create playlist: {result['message']}")
+    
+    with tab3:
+        st.header("Audio Feature Visualizations")
+        
+        viz_col1, viz_col2 = st.columns(2)
+        
+        with viz_col1:
+            st.subheader("BPM Distribution")
+            bpm_fig = cached_plot_bpm_histogram(original_df, optimized_df)
+            st.plotly_chart(bpm_fig, use_container_width=True)
+            
+            st.subheader("Energy vs. Valence")
+            ev_fig = plot_energy_valence(original_df, optimized_df)
+            st.plotly_chart(ev_fig, use_container_width=True)
+            
+        with viz_col2:
+            st.subheader("Musical Key Distribution")
+            key_fig = plot_key_wheel(optimized_df)
+            st.plotly_chart(key_fig, use_container_width=True)
+            
+    with tab4:
+        st.header("Recommended Tracks to Bridge Gaps")
+        
+        if st.session_state['recommendations'] and len(st.session_state['recommendations']) > 0:
+            rec_df = pd.DataFrame(st.session_state['recommendations'])
+            
+            st.dataframe(
+                rec_df[['position_to_insert', 'name', 'artists', 'tempo', 'key_name', 'energy', 'valence']],
+                column_config={
+                    'position_to_insert': st.column_config.NumberColumn('Insert After Position', format="%d"),
+                    'name': st.column_config.TextColumn('Track'),
+                    'artists': st.column_config.TextColumn('Artists'),
+                    'tempo': st.column_config.NumberColumn('BPM', format="%.1f"),
+                    'key_name': st.column_config.TextColumn('Key'),
+                    'energy': st.column_config.ProgressColumn('Energy', format="%.2f", min_value=0, max_value=1),
+                    'valence': st.column_config.ProgressColumn('Positivity', format="%.2f", min_value=0, max_value=1)
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            if st.button("Add Recommendations to Optimized Playlist"):
+                # Merge recommendations into the optimized playlist
+                with st.spinner("Adding recommendations to playlist..."):
+                    new_optimized_tracks = st.session_state['optimized_tracks'].copy()
+                    
+                    # Sort recommendations by position to insert
+                    sorted_recs = sorted(st.session_state['recommendations'], key=lambda x: x['position_to_insert'])
+                    
+                    # Add each recommendation at the specified position
+                    offset = 0
+                    for rec in sorted_recs:
+                        insert_pos = rec['position_to_insert'] + offset
+                        rec['new_position'] = insert_pos + 1
+                        new_optimized_tracks.insert(insert_pos + 1, rec)
+                        offset += 1
+                    
+                    # Update positions
+                    for i, track in enumerate(new_optimized_tracks):
+                        track['new_position'] = i + 1
+                    
+                    st.session_state['optimized_tracks'] = new_optimized_tracks
+                    st.success("✅ Recommendations added to optimized playlist!")
+                    st.rerun()
+        else:
+            st.info("No recommendations are available for this playlist. Try a playlist with more varied tracks.")
 
-                # Convert to dataframe
-                df = pd.DataFrame(track_data)
+# Select footer logo and colors based on theme
+if st.session_state['theme'] == 'dark':
+    footer_logo_path = "images/strnger_logo_white.svg"
+    footer_text_color = "#BBBBBB"
+    footer_subtext_color = "#888888" 
+    footer_border_color = "rgba(232, 95, 52, 0.2)"
+else:
+    footer_logo_path = "images/strnger_logo_transparent.svg"
+    footer_text_color = "#555555"
+    footer_subtext_color = "#888888"
+    footer_border_color = "rgba(232, 95, 52, 0.2)"
 
-                # Store original dataframe in session state
-                st.session_state.original_df = df
+# Enhanced footer with branding and theme support
+try:
+    footer_logo_base64 = get_svg_base64(footer_logo_path)
+    
+    st.markdown(f"""
+    <style>
+        .footer-container {{
+            border-top: 1px solid {footer_border_color};
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }}
+        .footer-row {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 1rem;
+        }}
+        .footer-logo {{
+            width: 40px;
+            margin-right: 16px;
+        }}
+        .footer-text {{
+            color: {footer_text_color};
+            font-size: 1rem;
+            font-weight: 500;
+        }}
+        .footer-highlight {{
+            background: linear-gradient(135deg, #E85F34 0%, #F57C52 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: bold;
+        }}
+        .spotify-credit {{
+            display: flex;
+            align-items: center;
+            font-size: 0.9rem;
+            color: {footer_subtext_color};
+            margin-top: 0.5rem;
+        }}
+        .spotify-logo {{
+            height: 20px;
+            margin-left: 6px;
+            margin-right: 6px;
+        }}
+    </style>
+    
+    <div class="footer-container">
+        <div class="footer-row">
+            <img src="{footer_logo_base64}" class="footer-logo">
+            <span class="footer-text">Made with <span style="color: #E85F34;">♥</span> by <span class="footer-highlight">STRNGER</span></span>
+        </div>
+        <div class="spotify-credit">
+            Powered by
+            <svg class="spotify-logo" viewBox="0 0 24 24" fill="none">
+                <path d="M12 0C5.4 0 0 5.4 0 12C0 18.6 5.4 24 12 24C18.6 24 24 18.6 24 12C24 5.4 18.66 0 12 0Z" fill="#1DB954"/>
+                <path d="M17.521 17.34C17.281 17.699 16.82 17.82 16.46 17.58C13.62 15.84 10.14 15.479 5.939 16.439C5.521 16.56 5.16 16.26 5.04 15.9C4.92 15.48 5.22 15.12 5.58 15C10.14 13.979 13.98 14.4 17.16 16.38C17.58 16.56 17.64 17.04 17.521 17.34Z" fill="white"/>
+                <path d="M18.961 14.04C18.66 14.46 18.12 14.64 17.7 14.34C14.46 12.36 9.54 11.76 5.76 12.96C5.34 13.08 4.74 12.84 4.62 12.42C4.5 12 4.74 11.4 5.16 11.28C9.6 9.9 15 10.56 18.72 12.84C19.081 13.02 19.261 13.62 18.961 14.04Z" fill="white"/>
+                <path d="M19.081 10.68C15.24 8.4 8.82 8.16 5.16 9.301C4.62 9.48 4.08 9.12 3.9 8.64C3.72 8.1 4.08 7.56 4.56 7.38C8.82 6.12 15.84 6.36 20.28 8.94C20.76 9.18 20.94 9.78 20.7 10.26C20.52 10.56 19.92 10.92 19.081 10.68Z" fill="white"/>
+            </svg>
+            Spotify Web API
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+except Exception as e:
+    # Fallback footer
+    st.markdown("---")
+    st.markdown("Made with ♥ by J.Wanjohi | Powered by Spotify Web API")
 
-                # Display visualizations
-                st.markdown("### Playlist Analysis")
-                col1, col2 = st.columns(2)
+def validate_env_variables():
+    required_vars = ['SPOTIPY_CLIENT_ID', 'SPOTIPY_CLIENT_SECRET', 'SPOTIPY_REDIRECT_URI']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        st.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+        st.info("Please create a .env file with the following variables:")
+        st.code("""
+SPOTIPY_CLIENT_ID=your_client_id
+SPOTIPY_CLIENT_SECRET=your_client_secret
+SPOTIPY_REDIRECT_URI=http://localhost:8501
+        """)
+        return False
+    return True
 
-                with col1:
-                    bpm_fig = plot_bpm_distribution(df)
-                    st.pyplot(bpm_fig)
+def check_session_timeout():
+    if 'last_activity' in st.session_state:
+        timeout = 3600  # 1 hour
+        if time.time() - st.session_state['last_activity'] > timeout:
+            st.session_state.clear()
+            st.warning("Session expired. Please reconnect to Spotify.")
+            return False
+    st.session_state['last_activity'] = time.time()
+    return True
 
-                with col2:
-                    camelot_fig = plot_camelot_wheel(df)
-                    st.pyplot(camelot_fig)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def fetch_playlist_tracks_with_retry(client, playlist_url):
+    try:
+        return fetch_playlist_tracks(client, playlist_url)
+    except Exception as e:
+        if "rate limit" in str(e).lower():
+            st.warning("Rate limit reached. Retrying in a few seconds...")
+            raise
+        st.error(f"Error fetching playlist: {str(e)}")
+        return None
 
-                # Optimize button
-                if st.button("Optimize Playlist for DJ Flow"):
-                    optimized_df = optimize_playlist(df)
-                    st.session_state.optimized_df = optimized_df
+def safe_load_file(file_path):
+    try:
+        with open(file_path, "r", encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        st.warning(f"File not found: {file_path}")
+        return ""
+    except Exception as e:
+        st.error(f"Error loading file {file_path}: {str(e)}")
+        return ""
 
-                # Display results in tabs
-                if st.session_state.optimized_df is not None:
-                    tab1, tab2, tab3 = st.tabs([
-                        "Original Playlist", "Optimized Playlist",
-                        "Transition Issues"
-                    ])
+def cleanup_session_data():
+    if 'original_tracks' in st.session_state and len(st.session_state['original_tracks']) > 1000:
+        st.warning("Large playlist detected. Some data may be cleared to optimize performance.")
+        # Keep only essential data
+        st.session_state['original_tracks'] = [
+            {k: v for k, v in track.items() if k in ['name', 'artists', 'uri']}
+            for track in st.session_state['original_tracks']
+        ]
 
-                    with tab1:
-                        st.markdown("### Original Playlist Order")
-                        # Display original tracks
-                        display_df = df[[
-                            'position', 'name', 'artist', 'tempo', 'key_name',
-                            'camelot', 'energy', 'valence'
-                        ]].copy()
-                        display_df = display_df.rename(
-                            columns={
-                                'position': 'Position',
-                                'name': 'Track Name',
-                                'artist': 'Artist',
-                                'tempo': 'BPM',
-                                'key_name': 'Key',
-                                'camelot': 'Camelot',
-                                'energy': 'Energy',
-                                'valence': 'Valence'
-                            })
-                        st.dataframe(display_df, use_container_width=True)
+@st.cache_data(ttl=3600)
+def cached_plot_bpm_histogram(original_df, optimized_df):
+    return plot_bpm_histogram(original_df, optimized_df)
 
-                    with tab2:
-                        st.markdown("### Optimized Playlist Order")
-                        optimized_df = st.session_state.optimized_df
+def safe_copy_to_clipboard(data):
+    try:
+        # Sanitize data
+        sanitized_data = '\n'.join(str(item) for item in data)
+        pyperclip.copy(sanitized_data)
+        return True
+    except Exception as e:
+        st.error(f"Error copying to clipboard: {str(e)}")
+        return False
 
-                        # Display optimized tracks
-                        display_df = optimized_df[[
-                            'optimized_position', 'name', 'artist', 'tempo',
-                            'key_name', 'camelot', 'energy', 'valence'
-                        ]].copy()
-                        display_df = display_df.rename(
-                            columns={
-                                'optimized_position': 'Position',
-                                'name': 'Track Name',
-                                'artist': 'Artist',
-                                'tempo': 'BPM',
-                                'key_name': 'Key',
-                                'camelot': 'Camelot',
-                                'energy': 'Energy',
-                                'valence': 'Valence'
-                            })
-                        st.dataframe(display_df, use_container_width=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
 
-                        # Export button
-                        st.markdown("#### Export Optimized Playlist")
+logger = logging.getLogger(__name__)
 
-                        # Create new playlist option
-                        if st.button(
-                                "Create New Spotify Playlist with Optimized Order"
-                        ):
-                            try:
-                                # Create a new playlist
-                                user_id = sp.me()['id']
-                                new_playlist = sp.user_playlist_create(
-                                    user=user_id,
-                                    name=
-                                    f"{playlist_name} (Optimized by Stringer)",
-                                    public=False,
-                                    description=
-                                    f"Optimized for DJ flow from {playlist_name}"
-                                )
-
-                                # Get all track URIs in the optimized order
-                                track_uris = optimized_df[
-                                    'spotify_uri'].tolist()
-
-                                # Add tracks to the new playlist
-                                sp.playlist_add_items(new_playlist['id'],
-                                                      track_uris)
-
-                                st.success(
-                                    f"✅ Created new playlist: {new_playlist['name']}"
-                                )
-                                st.markdown(
-                                    f"[Open in Spotify](https://open.spotify.com/playlist/{new_playlist['id']})"
-                                )
-                            except Exception as e:
-                                st.error(f"Error creating playlist: {str(e)}")
-
-                        # Download as CSV
-                        st.markdown(get_table_download_link(optimized_df),
-                                    unsafe_allow_html=True)
-
-                    with tab3:
-                        st.markdown("### Potential Transition Issues")
-
-                        # Find transitions that might need work
-                        gaps = find_transition_gaps(optimized_df)
-
-                        if not gaps:
-                            st.success(
-                                "No significant transition issues found! Your playlist should flow nicely."
-                            )
-                        else:
-                            st.warning(
-                                f"Found {len(gaps)} transitions that might need attention."
-                            )
-
-                            for i, (idx1, idx2, score) in enumerate(gaps):
-                                track1 = optimized_df.iloc[idx1]
-                                track2 = optimized_df.iloc[idx2]
-
-                                st.markdown(
-                                    f"#### Issue #{i+1}: Score {score:.1f}")
-                                st.markdown(
-                                    f"**From:** {track1['name']} by {track1['artist']} ({track1['tempo']} BPM, {track1['key_name']})"
-                                )
-                                st.markdown(
-                                    f"**To:** {track2['name']} by {track2['artist']} ({track2['tempo']} BPM, {track2['key_name']})"
-                                )
-
-                                # Show recommendation for transition
-                                st.markdown("##### Suggested fix:")
-
-                                if abs(track1['tempo'] - track2['tempo']) > 10:
-                                    st.markdown(
-                                        "- **BPM gap:** Consider adjusting tempo during transition"
-                                    )
-
-                                if track1['camelot'] != track2['camelot']:
-                                    st.markdown(
-                                        "- **Key change:** Mix in key or use an intermediate track"
-                                    )
-
-                                if abs(track1['energy'] -
-                                       track2['energy']) > 0.3:
-                                    st.markdown(
-                                        "- **Energy shift:** Use EQ to smooth transition"
-                                    )
-
-                                st.markdown("---")
-            except Exception as e:
-                st.error(f"Error processing playlist: {str(e)}")
-
-
-if __name__ == "__main__":
-    main()
+def log_error(error, context=None):
+    logger.error(f"Error: {str(error)}", extra={'context': context})
+    st.error(f"An error occurred: {str(error)}")
